@@ -740,7 +740,7 @@ def render_echarts_html_60(df, height=1050, sub1_metric="資金爆發"):
 
         sub1_series = [
             {"name": "長期方向上升", "type": "line", "data": clean_list(long_up_data), "xAxisIndex": 1, "yAxisIndex": 1, "showSymbol": False, "connectNulls": False, "lineStyle": {"color": "#FF3333", "width": 4}, "markPoint": {"data": hzs_points}},
-            {"name": "長期方向下降", "type": "line", "data": clean_list(long_down_data), "xAxisIndex": 1, "yAxisIndex": 1, "showSymbol": False, "connectNulls": False, "lineStyle": {"color": "#00CC66", "width": 4,}, "markPoint": {"data": lzs_points}},
+            {"name": "長期方向下降", "type": "line", "data": clean_list(long_down_data), "xAxisIndex": 1, "yAxisIndex": 1, "showSymbol": False, "connectNulls": False, "lineStyle": {"color": "#00CC66", "width": 4,}},
             {"name": "中級方向上升", "type": "line", "data": clean_list(medium_up_data), "xAxisIndex": 1, "yAxisIndex": 1, "showSymbol": False, "connectNulls": False, "lineStyle": {"color": "#FF6666", "width": 2}},
             {"name": "中級方向下降", "type": "line", "data": clean_list(medium_down_data), "xAxisIndex": 1, "yAxisIndex": 1, "showSymbol": False, "connectNulls": False, "lineStyle": {"color": "#00AA55", "width": 2}},
         ]
@@ -1263,10 +1263,10 @@ def render_echarts_html(df, height=1050, sub1_metric="資金爆發"):
 
         sub1_series = [
             {"name": "長期方向上升", "type": "line", "data": clean_list(long_up_data), "xAxisIndex": 1, "yAxisIndex": 1, "showSymbol": False, "connectNulls": False, "lineStyle": {"color": "#FF3333", "width": 4}, "markPoint": {"data": hzs_points}},
-            {"name": "長期方向下降", "type": "line", "data": clean_list(long_down_data), "xAxisIndex": 1, "yAxisIndex": 1, "showSymbol": False, "connectNulls": False, "lineStyle": {"color": "#00CC66", "width": 4,}, "markPoint": {"data": lzs_points}},
+            {"name": "長期方向下降", "type": "line", "data": clean_list(long_down_data), "xAxisIndex": 1, "yAxisIndex": 1, "showSymbol": False, "connectNulls": False, "lineStyle": {"color": "#00CC66", "width": 4}},
             {"name": "中級方向上升", "type": "line", "data": clean_list(medium_up_data), "xAxisIndex": 1, "yAxisIndex": 1, "showSymbol": False, "connectNulls": False, "lineStyle": {"color": "#FF6666", "width": 2}},
             {"name": "中級方向下降", "type": "line", "data": clean_list(medium_down_data), "xAxisIndex": 1, "yAxisIndex": 1, "showSymbol": False, "connectNulls": False, "lineStyle": {"color": "#00AA55", "width": 2}},
-        ]
+       ]
     else:
         sub1_series = get_subchart_data(df, sub1_metric)
 
