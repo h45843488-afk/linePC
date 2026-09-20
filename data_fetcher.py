@@ -85,7 +85,11 @@ def get_realtime_dde(stock_code):
         res = requests.get(url, headers={"X-API-KEY": FUGLE_API_KEY}, timeout=4)
         if res.status_code == 200:
             data = res.json()
-            price = data.get("lastPrice")
+            price = (
+    data.get("lastPrice")
+    or
+    data.get("closePrice")
+)
             if price is not None and float(price) > 0:
                 return {
                     "code": clean_code,
