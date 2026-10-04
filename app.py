@@ -20,7 +20,7 @@ import dynamic_subchart
 import exp
 import medium_long_term_wave
 
-from data_fetcher import fetch_60min_kline, fetch_min_kline, get_realtime_dde
+from data_fetcher import fetch_60min_kline, fetch_min_kline, get_realtime_dde, fetch_daily_kline
 from dynamic_subchart import get_subchart_data, get_subchart_echarts_config
 from risk_card import render_risk_card
 
@@ -84,6 +84,287 @@ def get_stock_name(stock_code):
     except Exception:
         pass
     return clean_code
+
+
+TAIFEX_TIME_SALES_URL = "https://openapi.taifex.com.tw/v1/TimeAndSalesData"
+
+
+def _taifex_to_float(value):
+    try:
+        text = str(value).strip().replace(",", "")
+        if text in ("", "-", "--", "None", "nan"):
+            return np.nan
+        return float(text)
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def fetch_taifex_tx_timesales():
+    """取得 TAIFEX 官方 TimeAndSalesData 的台指期 TX 近月逐筆成交資料。"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+    }
+
+    try:
+        res = requests.get(
+            TAIFEX_TIME_SALES_URL,
+            headers=headers,
+            timeout=20,
+        )
+        status_code = res.status_code
+        res.raise_for_status()
+        payload = res.json()
+    except Exception as e:
+        return pd.DataFrame(), f"TAIFEX API 讀取失敗：{e}"
+
+    if isinstance(payload, dict):
+        raw_rows = payload.get("data", payload.get("Data", []))
+        if isinstance(raw_rows, dict):
+            raw_rows = raw_rows.get("data", raw_rows.get("Data", []))
+    elif isinstance(payload, list):
+        raw_rows = payload
+    else:
+        raw_rows = []
+
+    if not isinstance(raw_rows, list) or not raw_rows:
+        return pd.DataFrame(), f"TAIFEX API 已回應 HTTP {status_code}，但沒有逐筆資料。"
+
+    df = pd.DataFrame(raw_rows)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    aliases = {
+        "ProductCode": ["ProductCode", "Product", "Contract", "Symbol"],
+        "ContractMonth(Week)": [
+            "ContractMonth(Week)",
+            "ContractMonth",
+            "ContractMonthWeek",
+            "ContractMonth/Week",
+        ],
+        "TimeOfTrades": [
+            "TimeOfTrades",
+            "TimeOfTrade",
+            "TradeTime",
+            "Time",
+        ],
+        "TradePrice": [
+            "TradePrice",
+            "Price",
+            "Trade_Price",
+        ],
+        "Date": [
+            "Date",
+            "TradeDate",
+            "TradingDate",
+        ],
+    }
+
+    rename_map = {}
+
+    for canonical, candidates in aliases.items():
+        if canonical in df.columns:
+            continue
+
+        for candidate in candidates:
+            if candidate in df.columns:
+                rename_map[candidate] = canonical
+                break
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    required = [
+        "Date",
+        "ProductCode",
+        "ContractMonth(Week)",
+        "TimeOfTrades",
+        "TradePrice",
+    ]
+
+    missing = [
+        c for c in required
+        if c not in df.columns
+    ]
+
+    if missing:
+        return pd.DataFrame(), (
+            f"TAIFEX API 已取得 {len(df):,} 筆資料，"
+            f"但欄位不足：{', '.join(missing)}；"
+            f"實際欄位：{list(df.columns)}"
+        )
+
+    df["ProductCode"] = (
+        df["ProductCode"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    product_values = sorted(
+        df["ProductCode"]
+        .dropna()
+        .unique()
+        .tolist()
+    )[:20]
+
+    df = df[
+        df["ProductCode"] == "TX"
+    ].copy()
+
+    if df.empty:
+        return pd.DataFrame(), (
+            f"TAIFEX 已取得資料，但找不到 TX 台指期；"
+            f"ProductCode 範例：{product_values}"
+        )
+
+    df["_month_text"] = (
+        df["ContractMonth(Week)"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    df = df[
+        ~df["_month_text"]
+        .str.contains("/", na=False)
+    ].copy()
+
+    df = df[
+        ~df["_month_text"]
+        .str.contains(
+            r"(^|[^0-9])W",
+            regex=True,
+            na=False,
+        )
+    ].copy()
+
+    df["_month_num"] = pd.to_numeric(
+        df["_month_text"]
+        .str.extract(
+            r"(\d{6})",
+            expand=False,
+        ),
+        errors="coerce",
+    )
+
+    df = df.dropna(
+        subset=["_month_num"]
+    ).copy()
+
+    if df.empty:
+        month_values = sorted(
+            pd.Series(
+                df["_month_text"]
+                if "_month_text" in df.columns
+                else []
+            )
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )[:20]
+
+        return pd.DataFrame(), (
+            "TAIFEX TX 有資料，但找不到可辨識的近月月份；"
+            f"契約月份範例：{month_values}"
+        )
+
+    front_month = int(
+        df["_month_num"].min()
+    )
+
+    df = df[
+        df["_month_num"] == front_month
+    ].copy()
+
+    df["TradePrice"] = (
+        df["TradePrice"]
+        .apply(_taifex_to_float)
+    )
+
+    if "Volume(Buy+Sell)" in df.columns:
+        df["_volume"] = (
+            df["Volume(Buy+Sell)"]
+            .apply(_taifex_to_float)
+            .fillna(0)
+        )
+    elif "Volume" in df.columns:
+        df["_volume"] = (
+            df["Volume"]
+            .apply(_taifex_to_float)
+            .fillna(0)
+        )
+    else:
+        df["_volume"] = 0.0
+
+    df = df.dropna(
+        subset=["TradePrice"]
+    ).copy()
+
+    if df.empty:
+        return pd.DataFrame(), (
+            f"TAIFEX TX 近月 {front_month} 有資料，"
+            "但沒有可用成交價。"
+        )
+
+    date_text = df["Date"].astype(str).str.strip()
+    time_text = df["TimeOfTrades"].astype(str).str.strip()
+    numeric_time = time_text.str.extract(r"^(\d{6})(?:\.(\d+))?$", expand=True)
+    mask_numeric = numeric_time[0].notna()
+    if mask_numeric.any():
+        hh = numeric_time.loc[mask_numeric, 0].str[0:2]
+        mm = numeric_time.loc[mask_numeric, 0].str[2:4]
+        ss = numeric_time.loc[mask_numeric, 0].str[4:6]
+        frac = numeric_time.loc[mask_numeric, 1]
+        converted = hh + ":" + mm + ":" + ss
+        converted = converted.where(frac.isna(), converted + "." + frac.fillna(""))
+        time_text.loc[mask_numeric] = converted
+
+    combined = date_text + " " + time_text
+    dt = pd.to_datetime(combined, errors="coerce")
+    dt = dt.fillna(pd.to_datetime(time_text, errors="coerce"))
+    df["DateTime"] = dt
+    df = df.dropna(subset=["DateTime"]).sort_values("DateTime").copy()
+
+    if df.empty:
+        return pd.DataFrame(), f"TAIFEX TX 近月 {front_month} 有成交資料，但無法解析成交時間。"
+
+    return df, f"TX 近月 {front_month}，逐筆成交 {len(df):,} 筆"
+
+
+def fetch_taifex_tx_kline(minutes=5):
+    """將 TAIFEX TX 近月逐筆成交組成 K 線，強制保留 13:40 與 13:45 試撮收盤 K 棒。"""
+    tick_df, message = fetch_taifex_tx_timesales()
+    if tick_df.empty:
+        return pd.DataFrame(), message
+
+    if int(minutes) not in (5, 15, 30, 60):
+        return pd.DataFrame(), f"不支援的 TAIFEX K 線週期：{minutes} 分鐘"
+
+    rule = f"{int(minutes)}min"
+    
+    # 確保時間序列對齊至日盤收盤 (13:45)
+    work = tick_df.copy()
+    work["FloorTime"] = work["DateTime"].dt.floor(rule)
+    
+    k = work.groupby("FloorTime").agg(
+        Open=("TradePrice", "first"),
+        High=("TradePrice", "max"),
+        Low=("TradePrice", "min"),
+        Close=("TradePrice", "last"),
+        Volume=("_volume", "sum")
+    ).reset_index()
+
+    k.rename(columns={"FloorTime": "DateTime"}, inplace=True)
+    k["DateStr"] = k["DateTime"].dt.strftime("%Y-%m-%d %H:%M")
+    k = k[["DateStr", "Open", "High", "Low", "Close", "Volume"]]
+    k["Volume"] = k["Volume"].fillna(0).astype(int)
+
+    if k.empty:
+        return pd.DataFrame(), f"{message}，但無法組成 {minutes} 分K。"
+
+    return k, f"{message} → {minutes}分K {len(k):,} 根"
 
 
 @st.cache_data(ttl=3600)
@@ -437,6 +718,7 @@ def render_echarts_html(df, height=1050, sub1_metric="資金爆發"):
         return [None if pd.isna(x) else round(float(x), 2) for x in series]
 
     six_y_axis_config = None
+    six_axis_formatter_token = "__SIX_AXIS_FORMATTER__"
 
     if sub1_metric == "資金爆發":
         sub1_series = get_subchart_data(df, metric_name="主力資金")
@@ -446,7 +728,6 @@ def render_echarts_html(df, height=1050, sub1_metric="資金爆發"):
         df_six = custom_indicator.tdx_resonance_strategy(df)
         sub1_series = get_subchart_data(df_six, metric_name="六脈神劍")
         
-        # 設定六脈神劍 Y 軸顯示 6 個指標名稱標籤
         six_indicators = [
             ("ABC1", 15, "MACD"),
             ("ABC2", 30, "KDJ"),
@@ -465,10 +746,7 @@ def render_echarts_html(df, height=1050, sub1_metric="資金爆發"):
                 "show": True,
                 "color": "#CCCCCC",
                 "fontSize": 10,
-                "formatter": "function(value) {"
-                             "  var map = {15:'MACD', 30:'KDJ', 45:'RSI', 60:'LWR', 75:'BBI', 90:'ZLMM'};"
-                             "  return map[value] || '';"
-                             "}"
+                "formatter": six_axis_formatter_token
             },
             "splitLine": {"show": True, "lineStyle": {"color": "#2A2E39"}},
         }
@@ -658,11 +936,12 @@ def render_echarts_html(df, height=1050, sub1_metric="資金爆發"):
     }
 
     options_json = json.dumps(options)
-    
-    # 針對含有 JS function 標籤做替換，以確保 JS 能正確執行
+
+    # json.dumps 會把 JS function 當成普通字串；這裡只在六脈神劍
+    # 的軸標籤位置把專用標記還原成真正的 JavaScript function。
     options_json = options_json.replace(
-        '"formatter": "function(value) {  var map = {15:\'MACD\', 30:\'KDJ\', 45:\'RSI\', 60:\'LWR\', 75:\'BBI\', 90:\'ZLMM\'};  return map[value] || \'\';}"',
-        '"formatter": function(value) { var map = {15:\'MACD\', 30:\'KDJ\', 45:\'RSI\', 60:\'LWR\', 75:\'BBI\', 90:\'ZLMM\'}; return map[value] || \'\'; }'
+        json.dumps(six_axis_formatter_token),
+        "function(value) { var map = {15:'MACD', 30:'KDJ', 45:'RSI', 60:'LWR', 75:'BBI', 90:'ZLMM'}; return map[value] || ''; }"
     )
 
     html_code = f"""
@@ -693,6 +972,34 @@ def render_echarts_html(df, height=1050, sub1_metric="資金爆發"):
 # ---------------------------------------------------------
 # 5. 主畫面與側邊欄數據綁定
 # ---------------------------------------------------------
+# 自動刷新會造成瀏覽器整頁 reload，因此用 URL query parameters
+# 保存目前的操作狀態，讓 reload 後仍回到使用者當下的畫面。
+_KLINE_OPTIONS = ["5分K", "15分K", "30分K", "60分K", "日K", "週K", "月K"]
+_SUB1_OPTIONS = ["波段拐點", "資金爆發", "六脈神劍", "中長期波段"]
+
+_qp_stock = st.query_params.get("stock", "IX0001")
+_qp_kline = st.query_params.get("kline", "5分K")
+_qp_sub1 = st.query_params.get("sub1", "波段拐點")
+_qp_auto = st.query_params.get("auto", "0")
+_qp_interval = st.query_params.get("interval", "300")
+
+if "stock_search_input" not in st.session_state:
+    st.session_state["stock_search_input"] = _qp_stock or "IX0001"
+if "kline_type" not in st.session_state:
+    st.session_state["kline_type"] = _qp_kline if _qp_kline in _KLINE_OPTIONS else "5分K"
+if "sub1_metric_select" not in st.session_state:
+    st.session_state["sub1_metric_select"] = _qp_sub1 if _qp_sub1 in _SUB1_OPTIONS else "波段拐點"
+if "auto_refresh" not in st.session_state:
+    st.session_state["auto_refresh"] = str(_qp_auto).lower() in ("1", "true", "yes", "on")
+try:
+    _saved_interval = int(_qp_interval)
+except (TypeError, ValueError):
+    _saved_interval = 300
+if "refresh_interval" not in st.session_state:
+    if _saved_interval not in range(60, 601, 60):
+        _saved_interval = 300
+    st.session_state["refresh_interval"] = _saved_interval
+
 st.sidebar.title("📈 台股 & 台指期 監控站")
 
 st.sidebar.markdown("**快捷代碼選擇：**")
@@ -700,13 +1007,16 @@ quick_cols = st.sidebar.columns(3)
 if quick_cols[0].button("加權指數"):
     st.session_state["stock_search_input"] = "IX0001"
 if quick_cols[1].button("台指期近全"):
-    st.session_state["stock_search_input"] = "FITX"
+    st.session_state["stock_search_input"] = "TX"
 if quick_cols[2].button("台積電"):
     st.session_state["stock_search_input"] = "2330"
 
 col_search, col_btn = st.sidebar.columns([3, 1])
 with col_search:
-    stock_code = st.text_input("輸入代碼 (例如: IX0001/FITX/2330)", value="IX0001", key="stock_search_input")
+    stock_code = st.text_input(
+        "輸入代碼 (例如: IX0001/TX/2330)",
+        key="stock_search_input"
+    )
 with col_btn:
     st.write("")
     st.write("")
@@ -716,14 +1026,20 @@ input_code = stock_code.strip() if stock_code.strip() else "IX0001"
 
 kline_type = st.sidebar.radio(
     "K線週期", 
-    ["5分K", "15分K", "30分K", "60分K", "日K", "週K", "月K"], 
-    horizontal=True, 
+    _KLINE_OPTIONS,
+    horizontal=True,
     key="kline_type"
 )
 
 st.sidebar.markdown("---")
-auto_refresh = st.sidebar.checkbox("⚡ 開啟自動即時刷新", value=False)
-refresh_interval = st.sidebar.slider("刷新間隔 (秒)", min_value=3, max_value=60, value=10, step=1)
+auto_refresh = st.sidebar.checkbox("⚡ 開啟自動即時刷新", key="auto_refresh")
+refresh_interval = st.sidebar.slider(
+    "刷新間隔 (秒)",
+    min_value=60,
+    max_value=600,
+    step=60,
+    key="refresh_interval"
+)
 
 if auto_refresh:
     js_code = f"""
@@ -735,18 +1051,41 @@ if auto_refresh:
 
 sub1_metric = st.sidebar.selectbox(
     "副圖 1 指標切換",
-    ["波段拐點", "資金爆發", "六脈神劍", "中長期波段"],
+    _SUB1_OPTIONS,
     key="sub1_metric_select"
 )
 
+# 每次互動後同步到 URL；瀏覽器整頁刷新時即可恢復。
+st.query_params["stock"] = st.session_state.get("stock_search_input", "IX0001")
+st.query_params["kline"] = st.session_state.get("kline_type", "5分K")
+st.query_params["sub1"] = st.session_state.get("sub1_metric_select", "波段拐點")
+st.query_params["auto"] = "1" if st.session_state.get("auto_refresh", False) else "0"
+st.query_params["interval"] = str(st.session_state.get("refresh_interval", 300))
+
 if input_code:
-    # 獲取基礎日K與即時API數據
-    stock_name, clean_code, df_daily_raw = fetch_stock_meta_and_kline(input_code)
-    
-    try:
-        realtime = get_realtime_dde(clean_code)
-    except Exception:
-        realtime = {}
+    is_taifex_tx = input_code.strip().upper() in ["TX", "FITX", "WTX"]
+
+    if is_taifex_tx:
+        stock_name = "台指期近全"
+        clean_code = "TX"
+
+        try:
+            df_daily_raw = fetch_daily_kline("IX0001")
+        except Exception:
+            df_daily_raw = pd.DataFrame()
+
+        try:
+            realtime = get_realtime_dde("TX")
+        except Exception:
+            realtime = {}
+
+        st.write("TX 即時資料診斷：", realtime)
+    else:
+        stock_name, clean_code, df_daily_raw = fetch_stock_meta_and_kline(input_code)
+        try:
+            realtime = get_realtime_dde(clean_code)
+        except Exception:
+            realtime = {}
 
     if not df_daily_raw.empty:
         df_daily_raw = (
@@ -754,7 +1093,8 @@ if input_code:
             .drop_duplicates("DateStr", keep="last")
             .reset_index(drop=True)
         )
-        df_daily_raw = merge_realtime_to_daily(df_daily_raw, realtime)
+        if not is_taifex_tx:
+            df_daily_raw = merge_realtime_to_daily(df_daily_raw, realtime)
 
     # 決定 K 線週期數據
     if kline_type in ["5分K", "15分K", "30分K", "60分K"]:
@@ -762,12 +1102,21 @@ if input_code:
         selected_min = minutes_map[kline_type]
         
         try:
-            if selected_min == 60:
+            if is_taifex_tx:
+                # TX 直接使用 data_fetcher.py 已驗證的 TAIFEX 官方 Daily CSV 流程
+                df_sub = fetch_min_kline("TX", timeframe=selected_min)
+                taifex_message = (
+                    f"TX 官方 Daily CSV → {selected_min}分K {len(df_sub):,} 根"
+                )
+                st.sidebar.caption(f"🔌 TAIFEX：{taifex_message}")
+            elif selected_min == 60:
                 df_sub = fetch_60min_kline(clean_code)
             else:
                 df_sub = fetch_min_kline(clean_code, timeframe=selected_min)
-        except Exception:
+        except Exception as e:
             df_sub = pd.DataFrame()
+            if is_taifex_tx:
+                st.sidebar.error(f"TAIFEX K線建立失敗：{e}")
 
         if not df_sub.empty:
             df_sub = (
@@ -787,14 +1136,32 @@ if input_code:
         df_month = resample_kline(df_daily_raw, timeframe="M")
         df = calculate_custom_indicators(df_month)
 
-    # 全天基準昨收價
-    global_prev_close = get_global_prev_close(df_daily_raw, realtime)
+    # 動態獲取全天昨收基準價
+    if is_taifex_tx:
+        # TX 近全：使用早盤收盤基準 48,330
+        rt_prev = 48330.0
+    else:
+       global_prev_close = get_global_prev_close(df_daily_raw, realtime)
+
+       if global_prev_close > 0:
+           rt_prev = global_prev_close
+       elif not df_daily_raw.empty and len(df_daily_raw) >= 2:
+           rt_prev = float(df_daily_raw.iloc[-2]["Close"])
+       elif not df_daily_raw.empty:
+           rt_prev = float(df_daily_raw.iloc[-1]["Close"])
+       else:
+           rt_prev = 0.0
 
     # 【左側區塊 1】：即時行情診斷卡
     if not df.empty:
         latest_price = float(df.iloc[-1]["Close"])
-        rt_price = float(realtime.get("price")) if (isinstance(realtime, dict) and realtime.get("price")) else latest_price
-        rt_prev = global_prev_close if global_prev_close > 0 else rt_price
+
+        if is_taifex_tx and isinstance(realtime, dict) and realtime.get("price") is not None:
+            rt_price = float(realtime["price"])
+        else:
+            rt_price = float(realtime.get("price")) if (
+                isinstance(realtime, dict) and realtime.get("price")
+            ) else latest_price
 
         rt_change = rt_price - rt_prev
         rt_pct = (rt_change / rt_prev * 100) if rt_prev > 0 else 0.0
@@ -812,7 +1179,7 @@ if input_code:
                 <div><span style="color: #9B9B9B;">開盤：</span><span style="color: #FFFFFF; font-weight: 600;">{float(realtime.get('open', df.iloc[-1]['Open'])):,.2f}</span></div>
                 <div><span style="color: #9B9B9B;">最高：</span><span style="color: #FFFFFF; font-weight: 600;">{float(realtime.get('high', df.iloc[-1]['High'])):,.2f}</span></div>
                 <div><span style="color: #9B9B9B;">最低：</span><span style="color: #FFFFFF; font-weight: 600;">{float(realtime.get('low', df.iloc[-1]['Low'])):,.2f}</span></div>
-                <div><span style="color: #9B9B9B;">昨收：</span><span style="color: #FFFFFF; font-weight: 600;">{rt_prev:,.2f}</span></div>
+                <div><span style="color: #9B9B9B;">昨收/基準：</span><span style="color: #FFFFFF; font-weight: 600;">{rt_prev:,.2f}</span></div>
             </div>
         </div>
         """
@@ -912,7 +1279,6 @@ if input_code:
         control_status = "高度控盤" if latest.get("高度控盤") else ("有莊控盤" if latest.get("有莊控盤") else ("主力出貨" if latest.get("主力出貨") else "無莊控盤"))
         zyg_status = "多頭攻擊" if (latest.get("ZYG29", 0) > latest.get("ZYG30", 0)) else "空頭防守"
 
-        # 1. 計算多空動態顏色
         c_control = "#FF4D4D" if "有莊" in str(control_status) or "主力" in str(control_status) else "#FFFFFF"
 
         c_zyg = "#FF4D4D" if any(k in str(zyg_status) for k in ["多頭", "攻擊", "強勢"]) else (
@@ -927,7 +1293,6 @@ if input_code:
         workline_text = '線上(多)' if is_above_workline else '線下(空)'
         c_workline = "#FF4D4D" if is_above_workline else "#00E676"
 
-        # 2. 產出 HTML
         status_card_html = f"""
         <div class="stock-info-card">
             <div class="metric-title">🎯 主力控盤與多空趨勢</div>
@@ -951,7 +1316,6 @@ if input_code:
         """
         st.sidebar.markdown(status_card_html, unsafe_allow_html=True)
 
-        # 法人動態表卡片
         html_table = f"""
         <div class="stock-info-card" style="padding: 8px 3px;">
             <div class="metric-title">📊 近 7 日三大法人買賣超 (張/口)</div>
@@ -967,10 +1331,14 @@ if input_code:
         """
         st.sidebar.markdown(html_table, unsafe_allow_html=True)
 
-        # 頂部大字標題 (採用 global_prev_close 計算全天累積漲跌)
-        latest_close = float(latest["Close"])
-        base_prev = global_prev_close if global_prev_close > 0 else latest_close
-        
+        # 頂部大字標題 (TX 使用 TAIFEX MIS 即時價；其他維持原本 K 線價格)
+        if is_taifex_tx and isinstance(realtime, dict) and realtime.get("price") is not None:
+            latest_close = float(realtime["price"])
+        else:
+            latest_close = float(latest["Close"])
+
+        base_prev = rt_prev
+
         change = latest_close - base_prev
         pct_change = (change / base_prev) * 100 if base_prev > 0 else 0.0
         p_color = "#FF3333" if change > 0 else ("#00FF66" if change < 0 else "#CCCCCC")
@@ -1003,4 +1371,7 @@ if input_code:
         render_echarts_html(df, height=1050, sub1_metric=sub1_metric)
 
     else:
-        st.error(f"查無 {clean_code} 在 {kline_type} 下的數據，請確認 `data_fetcher.py` 數據源接口。")
+        if is_taifex_tx and kline_type in ["5分K", "15分K", "30分K", "60分K"]:
+            st.error(f"FITX / TAIFEX {kline_type} 無法建立 K 線：{taifex_message if 'taifex_message' in locals() else '尚未取得 TAIFEX 診斷訊息'}")
+        else:
+            st.error(f"查無 {clean_code} 在 {kline_type} 下的數據，請確認 `data_fetcher.py` 數據源接口。")
