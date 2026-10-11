@@ -115,7 +115,7 @@ def fetch_min_kline(
     )
 
     # -------------------------------------------------
-    # TX → TAIFEX
+    # TX → TAIFEX（原流程保留）
     # -------------------------------------------------
     if clean_code == "TX":
 
@@ -124,7 +124,7 @@ def fetch_min_kline(
         )
 
     # -------------------------------------------------
-    # 原本 Fugle
+    # 股票 / 加權指數 → Fugle
     # -------------------------------------------------
     target_code = (
         "IX0001"
@@ -141,12 +141,39 @@ def fetch_min_kline(
         "X-API-KEY": FUGLE_API_KEY
     }
 
-    all_rows = []
+    # 歷史分鐘 K 本機快取：不同股票、不同週期分開保存。
+    cache_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "data_cache"
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(
+        cache_dir,
+        f"fugle_min_{target_code}_{timeframe}.csv"
+    )
+
+    cached_df = pd.DataFrame()
+    if os.path.isfile(cache_path):
+        try:
+            cached_df = pd.read_csv(
+                cache_path,
+                dtype={"DateStr": str}
+            )
+            required_columns = [
+                "DateStr", "Open", "High", "Low", "Close", "Volume"
+            ]
+            if not all(col in cached_df.columns for col in required_columns):
+                cached_df = pd.DataFrame()
+            else:
+                cached_df = cached_df[required_columns].copy()
+        except Exception as e:
+            print(f"[FUGLE 分K快取讀取失敗] {target_code}: {e}")
+            cached_df = pd.DataFrame()
 
     # -------------------------------------------------
-    # A. 歷史分鐘 K
-    #    明確指定日期，避免 API 未指定 from 時只回傳最近一個月。
-    #    富果單次歷史查詢區間必須少於一年，因此分段抓取。
+    # A. 更新歷史分鐘 K
+    #    第一次下載完整可用歷史；之後從快取最新日期往前回補 7 天，
+    #    避免每次切換週期或重新開啟程式都重抓多年資料。
     # -------------------------------------------------
     try:
 
@@ -155,9 +182,20 @@ def fetch_min_kline(
             f"stock/historical/candles/{target_code}"
         )
 
-        # 富果股票歷史分鐘 K 起始日期：2023-05-23。
+        history_rows = []
         range_start = pd.Timestamp("2023-05-23")
         range_end = pd.Timestamp.now().normalize()
+
+        if not cached_df.empty:
+            cached_dates = pd.to_datetime(
+                cached_df["DateStr"],
+                errors="coerce"
+            ).dropna()
+            if not cached_dates.empty:
+                range_start = max(
+                    pd.Timestamp("2023-05-23"),
+                    cached_dates.max().normalize() - pd.Timedelta(days=7)
+                )
 
         while range_start <= range_end:
 
@@ -179,16 +217,10 @@ def fetch_min_kline(
             )
 
             if res_h.status_code == 200:
-
-                all_rows.extend(
-                    res_h.json().get(
-                        "data",
-                        []
-                    )
+                history_rows.extend(
+                    res_h.json().get("data", [])
                 )
-
             elif res_h.status_code != 404:
-
                 print(
                     f"[FUGLE 歷史分K HTTP錯誤] "
                     f"{target_code} "
@@ -199,16 +231,43 @@ def fetch_min_kline(
 
             range_start = chunk_end + pd.Timedelta(days=1)
 
+        new_history_df = _format_fugle_dataframe(history_rows)
+
+        if not cached_df.empty or not new_history_df.empty:
+            historical_df = pd.concat(
+                [cached_df, new_history_df],
+                ignore_index=True
+            )
+            historical_df["DateStr"] = pd.to_datetime(
+                historical_df["DateStr"],
+                errors="coerce"
+            ).dt.strftime("%Y-%m-%d %H:%M:%S")
+            historical_df = (
+                historical_df
+                .dropna(subset=["DateStr"])
+                .sort_values("DateStr")
+                .drop_duplicates(subset=["DateStr"], keep="last")
+                .reset_index(drop=True)
+            )
+            try:
+                historical_df.to_csv(
+                    cache_path,
+                    index=False,
+                    encoding="utf-8-sig"
+                )
+            except Exception as e:
+                print(f"[FUGLE 分K快取寫入失敗] {target_code}: {e}")
+        else:
+            historical_df = pd.DataFrame()
+
     except Exception as e:
-
-        print(
-            f"[FUGLE 歷史分K失敗] "
-            f"{target_code}: {e}"
-        )
+        print(f"[FUGLE 歷史分K失敗] {target_code}: {e}")
+        historical_df = cached_df
 
     # -------------------------------------------------
-    # B. 當日盤中分鐘 K
+    # B. 當日盤中分鐘 K（每次仍抓最新資料）
     # -------------------------------------------------
+    live_df = pd.DataFrame()
     try:
 
         url_live = (
@@ -226,23 +285,29 @@ def fetch_min_kline(
         )
 
         if res_l.status_code == 200:
-
-            all_rows.extend(
-                res_l.json().get(
-                    "data",
-                    []
-                )
+            live_df = _format_fugle_dataframe(
+                res_l.json().get("data", [])
             )
 
     except Exception as e:
+        print(f"[FUGLE 即時分K失敗] {target_code}: {e}")
 
-        print(
-            f"[FUGLE 即時分K失敗] "
-            f"{target_code}: {e}"
-        )
+    # 歷史快取與即時資料合併；相同時間以即時資料為準。
+    frames = [df for df in [historical_df, live_df] if not df.empty]
+    if not frames:
+        return pd.DataFrame()
 
-    return _format_fugle_dataframe(
-        all_rows
+    combined_df = pd.concat(frames, ignore_index=True)
+    combined_df["DateStr"] = pd.to_datetime(
+        combined_df["DateStr"],
+        errors="coerce"
+    ).dt.strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        combined_df
+        .dropna(subset=["DateStr"])
+        .sort_values("DateStr")
+        .drop_duplicates(subset=["DateStr"], keep="last")
+        .reset_index(drop=True)
     )
 
 
