@@ -711,7 +711,7 @@ def calculate_custom_indicators(df):
 # ---------------------------------------------------------
 # 4. ECharts 圖表繪製
 # ---------------------------------------------------------
-def render_echarts_html(df, height=1050, sub1_metric="資金爆發"):
+def render_echarts_html(df, height=1050, sub1_metric="資金爆發", chart_state_key="default"):
     dates = df["DateStr"].tolist()
 
     def clean_list(series):
@@ -960,7 +960,94 @@ def render_echarts_html(df, height=1050, sub1_metric="資金爆發"):
             var chartDom = document.getElementById('main');
             var myChart = echarts.init(chartDom, 'dark');
             var option = {options_json};
+            var chartStateKey = "tw_kline_chart_state_" + {json.dumps(str(chart_state_key))};
+            var categoryDates = (option.xAxis && option.xAxis[0] && option.xAxis[0].data) || [];
+
+            // 刷新前保存的檢視範圍：優先使用日期定位，新增 K 棒後也不會把原畫面擠小。
+            function restoreChartState() {{
+                try {{
+                    var raw = window.localStorage.getItem(chartStateKey);
+                    if (!raw) return;
+                    var saved = JSON.parse(raw);
+                    if (!saved || !saved.dataZoom) return;
+
+                    var startIndex = categoryDates.indexOf(saved.startDate);
+                    var endIndex = categoryDates.indexOf(saved.endDate);
+                    if (startIndex >= 0 && endIndex >= startIndex) {{
+                        option.dataZoom = option.dataZoom || [];
+                        option.dataZoom.forEach(function(dz) {{
+                            dz.startValue = startIndex;
+                            dz.endValue = endIndex;
+                            delete dz.start;
+                            delete dz.end;
+                        }});
+                    }} else if (typeof saved.start === "number" && typeof saved.end === "number") {{
+                        option.dataZoom = option.dataZoom || [];
+                        option.dataZoom.forEach(function(dz) {{
+                            dz.start = saved.start;
+                            dz.end = saved.end;
+                            delete dz.startValue;
+                            delete dz.endValue;
+                        }});
+                    }}
+
+                    // 若日後圖表加入圖例，亦保留各指標的顯示/隱藏狀態。
+                    if (saved.legendSelected) {{
+                        option.legend = option.legend || {{}};
+                        option.legend.selected = saved.legendSelected;
+                    }}
+                }} catch (e) {{
+                    console.warn("讀取圖表檢視狀態失敗：", e);
+                }}
+            }}
+
+            function saveChartState() {{
+                try {{
+                    var current = myChart.getOption();
+                    var dz = (current.dataZoom && current.dataZoom[0]) || {{}};
+                    var hasValueRange = dz.startValue !== undefined && dz.startValue !== null &&
+                                        dz.endValue !== undefined && dz.endValue !== null;
+                    var startIndex = hasValueRange ? Number(dz.startValue) : NaN;
+                    var endIndex = hasValueRange ? Number(dz.endValue) : NaN;
+
+                    // 不同 ECharts 事件版本可能只提供百分比，這裡一併兼容。
+                    if (!Number.isFinite(startIndex) || !Number.isFinite(endIndex)) {{
+                        var startPct = Number(dz.start || 0);
+                        var endPct = Number(dz.end || 100);
+                        startIndex = Math.round((startPct / 100) * Math.max(0, categoryDates.length - 1));
+                        endIndex = Math.round((endPct / 100) * Math.max(0, categoryDates.length - 1));
+                    }}
+
+                    startIndex = Math.max(0, Math.min(categoryDates.length - 1, Math.round(startIndex)));
+                    endIndex = Math.max(startIndex, Math.min(categoryDates.length - 1, Math.round(endIndex)));
+                    var state = {{
+                        startDate: categoryDates[startIndex],
+                        endDate: categoryDates[endIndex],
+                        start: Number(dz.start),
+                        end: Number(dz.end),
+                        dataZoom: true,
+                        legendSelected: (current.legend && current.legend[0] && current.legend[0].selected) || null
+                    }};
+                    window.localStorage.setItem(chartStateKey, JSON.stringify(state));
+                }} catch (e) {{
+                    console.warn("保存圖表檢視狀態失敗：", e);
+                }}
+            }}
+
+            restoreChartState();
             myChart.setOption(option);
+
+            // 縮放、拖曳、滑動下方縮放條後立即保存，供自動/手動刷新恢復。
+            myChart.on('datazoom', function() {{
+                saveChartState();
+            }});
+            myChart.on('legendselectchanged', function() {{
+                saveChartState();
+            }});
+
+            // 初次顯示也存一份目前範圍，之後刷新就有可恢復的基準。
+            setTimeout(saveChartState, 0);
+            window.addEventListener('beforeunload', saveChartState);
             window.addEventListener('resize', function() {{ myChart.resize(); }});
         </script>
     </body>
@@ -1368,7 +1455,7 @@ if input_code:
         st.markdown(pc_header_html, unsafe_allow_html=True)
 
         render_risk_card(df)
-        render_echarts_html(df, height=1050, sub1_metric=sub1_metric)
+        render_echarts_html(df, height=1050, sub1_metric=sub1_metric, chart_state_key=f"{clean_code}_{kline_type}")
 
     else:
         if is_taifex_tx and kline_type in ["5分K", "15分K", "30分K", "60分K"]:
