@@ -563,6 +563,164 @@ def ema_func(series, period):
     return series.ewm(span=period, adjust=False, min_periods=0).mean()
 
 
+def zig_turning_points(close: np.ndarray, threshold: float = 0.00001) -> list:
+    """識別收盤價的之字轉向點，轉折確認依賴後續價格走勢。"""
+    n = len(close)
+    if n < 2:
+        return [n - 1] if n else []
+
+    turning_indices = []
+    direction = 0
+    candidate_idx = 0
+    candidate_price = close[0]
+
+    for i in range(1, n):
+        price = close[i]
+        if direction == 0:
+            if price > candidate_price * (1 + threshold):
+                direction = 1
+                candidate_price = price
+                candidate_idx = i
+            elif price < candidate_price * (1 - threshold):
+                direction = -1
+                candidate_price = price
+                candidate_idx = i
+        elif direction == 1:
+            if price > candidate_price:
+                candidate_price = price
+                candidate_idx = i
+            elif price < candidate_price * (1 - threshold):
+                turning_indices.append(candidate_idx)
+                direction = -1
+                candidate_price = price
+                candidate_idx = i
+        else:
+            if price < candidate_price:
+                candidate_price = price
+                candidate_idx = i
+            elif price > candidate_price * (1 + threshold):
+                turning_indices.append(candidate_idx)
+                direction = 1
+                candidate_price = price
+                candidate_idx = i
+
+    turning_indices.append(n - 1)
+    return sorted(set(turning_indices))
+
+
+def compute_dclose_dvol(
+    close: np.ndarray,
+    volume: np.ndarray,
+    threshold: float = 0.00001
+) -> tuple:
+    """依照本次提供的分段規則計算 DCLOSE、DVOL。"""
+    n = len(close)
+    dclose = np.full(n, np.nan)
+    dvol = np.full(n, np.nan)
+    if n == 0:
+        return dclose, dvol
+
+    turning = zig_turning_points(close, threshold=threshold)
+    bounds = turning + [n - 1]
+    start = 0
+    for end in bounds:
+        dclose[start:end + 1] = close[end]
+        dvol[start:end + 1] = np.nansum(volume[start:end + 1]) * 100
+        start = end + 1
+
+    return dclose, dvol
+
+
+def cross(series_a: np.ndarray, series_b: np.ndarray) -> np.ndarray:
+    """通達信 CROSS：前一根 A <= B，當前 A > B。"""
+    n = len(series_a)
+    result = np.zeros(n, dtype=bool)
+    for i in range(1, n):
+        if np.isnan(series_a[i]) or np.isnan(series_b[i]):
+            continue
+        if np.isnan(series_a[i - 1]) or np.isnan(series_b[i - 1]):
+            continue
+        if series_a[i - 1] <= series_b[i - 1] and series_a[i] > series_b[i]:
+            result[i] = True
+    return result
+
+
+def calculate_dclose_dvol_from_zigzag(df, reversal=0.00001):
+    """保留 app.py 原呼叫方式，將計算結果放回 DataFrame。"""
+    out = df.copy()
+    close = pd.to_numeric(out["Close"], errors="coerce").to_numpy(dtype=float)
+    volume = pd.to_numeric(out["Volume"], errors="coerce").fillna(0).to_numpy(dtype=float)
+    dclose, dvol = compute_dclose_dvol(close, volume, threshold=reversal)
+    out["DCLOSE"] = dclose
+    out["DVOL"] = dvol
+    return out
+
+
+def ghost_start_signal(
+    df: pd.DataFrame,
+    accel_threshold: float = 9.8,
+    vol_accel_threshold: float = 500.0
+) -> pd.Series:
+    """依照提供的公式計算鬼啟動訊號。"""
+    close = df["C"].to_numpy(dtype=float)
+    volume = df["V"].to_numpy(dtype=float)
+    n = len(close)
+
+    dclose, dvol = compute_dclose_dvol(close, volume)
+
+    a1 = np.full(n, np.nan)
+    a1[1:] = close[:-1]
+
+    a3 = np.full(n, np.nan)
+    valid = (~np.isnan(dclose)) & (~np.isnan(a1)) & (a1 != 0)
+    a3[valid] = (dclose[valid] - a1[valid]) / a1[valid] * 100
+
+    a3_prev = np.full(n, np.nan)
+    a3_prev[1:] = a3[:-1]
+    aa1 = np.full(n, np.nan)
+    valid_aa1 = (~np.isnan(a3)) & (~np.isnan(a3_prev))
+    aa1[valid_aa1] = a3[valid_aa1] - a3_prev[valid_aa1]
+
+    a11 = np.full(n, np.nan)
+    a11[1:] = volume[:-1]
+    a13 = np.full(n, np.nan)
+    valid_a13 = (~np.isnan(dvol)) & (~np.isnan(a11)) & (a11 != 0)
+    a13[valid_a13] = dvol[valid_a13] / a11[valid_a13]
+
+    a13_prev = np.full(n, np.nan)
+    a13_prev[1:] = a13[:-1]
+    aa3 = np.full(n, np.nan)
+    valid_aa3 = (~np.isnan(a13)) & (~np.isnan(a13_prev))
+    aa3[valid_aa3] = a13[valid_aa3] - a13_prev[valid_aa3]
+
+    signal_cross_aa1 = cross(aa1, np.full(n, accel_threshold))
+    signal_cross_aa3 = cross(aa3, np.full(n, vol_accel_threshold))
+    return pd.Series(signal_cross_aa1 & signal_cross_aa3, index=df.index, name="鬼啟動")
+
+
+def calculate_ghost_start_signal(df):
+    """保留 app.py 原介面，輸出鬼啟動訊號與主圖標記欄位。"""
+    df = df.copy()
+    if "C" not in df.columns:
+        df["C"] = pd.to_numeric(df["Close"], errors="coerce")
+    if "V" not in df.columns:
+        df["V"] = pd.to_numeric(df["Volume"], errors="coerce")
+    if "LOW" not in df.columns:
+        df["LOW"] = pd.to_numeric(df["Low"], errors="coerce")
+
+    dclose, dvol = compute_dclose_dvol(
+        df["C"].to_numpy(dtype=float),
+        df["V"].to_numpy(dtype=float)
+    )
+    df["DCLOSE"] = dclose
+    df["DVOL"] = dvol
+    df["鬼啟動訊號"] = ghost_start_signal(df).to_numpy(dtype=bool)
+    df["鬼啟動文字"] = np.where(df["鬼啟動訊號"], "鬼啟動", "")
+    df["鬼啟動文字位置"] = np.where(df["鬼啟動訊號"], df["LOW"] * 0.99, np.nan)
+    df["鬼啟動圖示位置"] = np.where(df["鬼啟動訊號"], df["LOW"] * 0.99, np.nan)
+    df["鬼啟動圖示編號"] = np.where(df["鬼啟動訊號"], 23, np.nan)
+    return df
+
 def calculate_custom_indicators(df):
     if df.empty or len(df) < 5:
         return df
@@ -705,6 +863,26 @@ def calculate_custom_indicators(df):
     df["高度控盤"] = (winner_95 > 50) & (df["Close"] > cost_85) & (df["控盤"] > 0)
     df["主力出貨"] = (df["控盤"] < df["控盤_REF"]) & (df["控盤"] > 0)
 
+    # 鬼啟動：C/V/LOW 對應目前 K 線資料欄位；DCLOSE/DVOL 獨立依之字轉向估算，
+    # 不直接以 Close/Volume 取代特殊欄位。若來源本身已提供 DCLOSE/DVOL，則保留來源值。
+    if "C" not in df.columns:
+        df["C"] = pd.to_numeric(df["Close"], errors="coerce")
+    if "V" not in df.columns:
+        df["V"] = pd.to_numeric(df["Volume"], errors="coerce")
+    if "LOW" not in df.columns:
+        df["LOW"] = pd.to_numeric(df["Low"], errors="coerce")
+    if not {"DCLOSE", "DVOL"}.issubset(df.columns):
+        df = calculate_dclose_dvol_from_zigzag(df, reversal=0.00001)
+    ghost_required_columns = {"C", "DCLOSE", "V", "DVOL", "LOW"}
+    if ghost_required_columns.issubset(df.columns):
+        df = calculate_ghost_start_signal(df)
+    else:
+        df["鬼啟動訊號"] = False
+        df["鬼啟動文字"] = ""
+        df["鬼啟動文字位置"] = np.nan
+        df["鬼啟動圖示位置"] = np.nan
+        df["鬼啟動圖示編號"] = np.nan
+
     return df
 
 
@@ -838,6 +1016,26 @@ def render_echarts_html(df, height=1050, sub1_metric="資金爆發", chart_state
                 "itemStyle": {"color": "#00FF00"},
                 "label": {"position": "top", "distance": 5, "fontSize": 11, "color": "#00FF00"},
             })
+        # 鬼啟動：主圖 K 線下方顯示白色文字提示。
+        if bool(row.get("鬼啟動訊號", False)):
+            ghost_y = row.get("鬼啟動文字位置")
+            if pd.notna(ghost_y):
+                mark_points.append({
+                    "name": "鬼啟動",
+                    "coord": [str(row["DateStr"]), float(ghost_y)],
+                    "value": "鬼啟動",
+                    "symbol": "circle",
+                    "symbolSize": 8,
+                    "itemStyle": {"color": "#FFFFFF"},
+                    "label": {
+                        "show": True,
+                        "formatter": "鬼啟動",
+                        "position": "bottom",
+                        "distance": 5,
+                        "fontSize": 12,
+                        "color": "#FFFFFF",
+                    },
+                })
 
     vol_base_data, vol_white_line_data = [], []
     for _, row in df.iterrows():
@@ -960,94 +1158,91 @@ def render_echarts_html(df, height=1050, sub1_metric="資金爆發", chart_state
             var chartDom = document.getElementById('main');
             var myChart = echarts.init(chartDom, 'dark');
             var option = {options_json};
-            var chartStateKey = "tw_kline_chart_state_" + {json.dumps(str(chart_state_key))};
-            var categoryDates = (option.xAxis && option.xAxis[0] && option.xAxis[0].data) || [];
 
-            // 刷新前保存的檢視範圍：優先使用日期定位，新增 K 棒後也不會把原畫面擠小。
-            function restoreChartState() {{
+            // 以股票代碼 + K 線週期分開保存縮放比例，避免每次刷新都回到預設大小。
+            // 刷新時保留使用者當時看到的 K 棒數量，並將右側固定到最新一根。
+            var chartStateKey = "tw_kline_zoom_" + {json.dumps(chart_state_key)};
+            var chartStorage = null;
+
+            try {{
+                chartStorage = window.parent.localStorage;
+                // 先測試父頁儲存空間是否可用。
+                var testKey = chartStateKey + "_test";
+                chartStorage.setItem(testKey, "1");
+                chartStorage.removeItem(testKey);
+            }} catch (e) {{
                 try {{
-                    var raw = window.localStorage.getItem(chartStateKey);
-                    if (!raw) return;
-                    var saved = JSON.parse(raw);
-                    if (!saved || !saved.dataZoom) return;
-
-                    var startIndex = categoryDates.indexOf(saved.startDate);
-                    var endIndex = categoryDates.indexOf(saved.endDate);
-                    if (startIndex >= 0 && endIndex >= startIndex) {{
-                        option.dataZoom = option.dataZoom || [];
-                        option.dataZoom.forEach(function(dz) {{
-                            dz.startValue = startIndex;
-                            dz.endValue = endIndex;
-                            delete dz.start;
-                            delete dz.end;
-                        }});
-                    }} else if (typeof saved.start === "number" && typeof saved.end === "number") {{
-                        option.dataZoom = option.dataZoom || [];
-                        option.dataZoom.forEach(function(dz) {{
-                            dz.start = saved.start;
-                            dz.end = saved.end;
-                            delete dz.startValue;
-                            delete dz.endValue;
-                        }});
-                    }}
-
-                    // 若日後圖表加入圖例，亦保留各指標的顯示/隱藏狀態。
-                    if (saved.legendSelected) {{
-                        option.legend = option.legend || {{}};
-                        option.legend.selected = saved.legendSelected;
-                    }}
-                }} catch (e) {{
-                    console.warn("讀取圖表檢視狀態失敗：", e);
+                    chartStorage = window.localStorage;
+                }} catch (e2) {{
+                    chartStorage = null;
                 }}
             }}
 
-            function saveChartState() {{
-                try {{
-                    var current = myChart.getOption();
-                    var dz = (current.dataZoom && current.dataZoom[0]) || {{}};
-                    var hasValueRange = dz.startValue !== undefined && dz.startValue !== null &&
-                                        dz.endValue !== undefined && dz.endValue !== null;
-                    var startIndex = hasValueRange ? Number(dz.startValue) : NaN;
-                    var endIndex = hasValueRange ? Number(dz.endValue) : NaN;
-
-                    // 不同 ECharts 事件版本可能只提供百分比，這裡一併兼容。
-                    if (!Number.isFinite(startIndex) || !Number.isFinite(endIndex)) {{
-                        var startPct = Number(dz.start || 0);
-                        var endPct = Number(dz.end || 100);
-                        startIndex = Math.round((startPct / 100) * Math.max(0, categoryDates.length - 1));
-                        endIndex = Math.round((endPct / 100) * Math.max(0, categoryDates.length - 1));
+            // 新版保存「實際可視 K 棒根數」，不再保存百分比。
+            // 舊版保存的是百分比，無法可靠代表根數，因此首次載入改用預設視窗，之後保存根數。
+            var savedCount = null;
+            try {{
+                if (chartStorage) {{
+                    var savedValue = chartStorage.getItem(chartStateKey);
+                    if (savedValue && savedValue.indexOf('count:') === 0) {{
+                        var parsedCount = parseInt(savedValue.substring(6), 10);
+                        if (isFinite(parsedCount) && parsedCount > 0) {{
+                            savedCount = parsedCount;
+                        }}
                     }}
-
-                    startIndex = Math.max(0, Math.min(categoryDates.length - 1, Math.round(startIndex)));
-                    endIndex = Math.max(startIndex, Math.min(categoryDates.length - 1, Math.round(endIndex)));
-                    var state = {{
-                        startDate: categoryDates[startIndex],
-                        endDate: categoryDates[endIndex],
-                        start: Number(dz.start),
-                        end: Number(dz.end),
-                        dataZoom: true,
-                        legendSelected: (current.legend && current.legend[0] && current.legend[0].selected) || null
-                    }};
-                    window.localStorage.setItem(chartStateKey, JSON.stringify(state));
-                }} catch (e) {{
-                    console.warn("保存圖表檢視狀態失敗：", e);
                 }}
-            }}
+            }} catch (e) {{}}
 
-            restoreChartState();
+            var defaultVisibleCount = Math.min(70, Math.max(1, {total_len}));
+            var restoreLatestView = function() {{
+                var visibleCount = Math.min({total_len}, savedCount !== null ? savedCount : defaultVisibleCount);
+                var span = Math.min(100, Math.max(0.1, visibleCount / Math.max(1, {total_len}) * 100));
+                var restoredStart = Math.max(0, 100 - span);
+                myChart.dispatchAction({{
+                    type: 'dataZoom',
+                    dataZoomIndex: 0,
+                    start: restoredStart,
+                    end: 100
+                }});
+                myChart.dispatchAction({{
+                    type: 'dataZoom',
+                    dataZoomIndex: 1,
+                    start: restoredStart,
+                    end: 100
+                }});
+                // 把首次載入的預設根數也存起來，後續刷新一律沿用根數。
+                try {{
+                    if (chartStorage) chartStorage.setItem(chartStateKey, 'count:' + visibleCount);
+                }} catch (e) {{}}
+            }};
+
+            myChart.on('finished', function restoreAfterFirstRender() {{
+                myChart.off('finished', restoreAfterFirstRender);
+                window.requestAnimationFrame(function() {{
+                    restoreLatestView();
+                }});
+            }});
+
             myChart.setOption(option);
 
-            // 縮放、拖曳、滑動下方縮放條後立即保存，供自動/手動刷新恢復。
-            myChart.on('datazoom', function() {{
-                saveChartState();
-            }});
-            myChart.on('legendselectchanged', function() {{
-                saveChartState();
-            }});
+            // 使用者縮放或拖曳後，記錄可視範圍大小。
+            // 下一次自動刷新時沿用這個大小，但視窗右緣自動移至最新 K 棒。
+            var saveZoomSpan = function() {{
+                try {{
+                    if (!chartStorage) return;
+                    var zoomList = myChart.getOption().dataZoom || [];
+                    if (!zoomList.length) return;
+                    var start = Number(zoomList[0].start);
+                    var end = Number(zoomList[0].end);
+                    if (isFinite(start) && isFinite(end) && end > start) {{
+                        var visibleCount = Math.round((end - start) / 100 * {total_len});
+                        visibleCount = Math.max(1, Math.min({total_len}, visibleCount));
+                        chartStorage.setItem(chartStateKey, 'count:' + visibleCount);
+                    }}
+                }} catch (e) {{}}
+            }};
 
-            // 初次顯示也存一份目前範圍，之後刷新就有可恢復的基準。
-            setTimeout(saveChartState, 0);
-            window.addEventListener('beforeunload', saveChartState);
+            myChart.on('datazoom', saveZoomSpan);
             window.addEventListener('resize', function() {{ myChart.resize(); }});
         </script>
     </body>
