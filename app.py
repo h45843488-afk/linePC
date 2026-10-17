@@ -367,60 +367,75 @@ def fetch_taifex_tx_kline(minutes=5):
     return k, f"{message} → {minutes}分K {len(k):,} 根"
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=300)
 def fetch_institutional_data(stock_code):
-    """取得近 7 日三大法人買賣超資料（含帶容錯機制）"""
-    clean_code = str(stock_code).strip().upper().replace(".TW", "").replace(".TWO", "")
-    target_id = "TAIEX" if clean_code in ["IX0001", "0000", "TAIEX"] else clean_code
-    
-    end_date = datetime.date.today().strftime("%Y-%m-%d")
-    start_date = (datetime.date.today() - datetime.timedelta(days=20)).strftime("%Y-%m-%d")
-    
+    clean_code = str(stock_code).strip().replace(".TW", "").replace(".TWO", "")
+    start_date = (
+        datetime.date.today() - datetime.timedelta(days=15)
+    ).strftime("%Y-%m-%d")
     url = "https://api.finmindtrade.com/api/v4/data"
     params = {
         "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
-        "data_id": target_id,
+        "data_id": clean_code,
         "start_date": start_date,
-        "end_date": end_date,
     }
-    
+
     try:
-        res = requests.get(url, params=params, timeout=5)
+        time.sleep(0.1)
+        res = requests.get(url, params=params, timeout=8)
         data = res.json()
-        if data.get("msg") == "success" and data.get("data"):
-            df = pd.DataFrame(data["data"])
-            df["buy_minus_sell"] = (df["buy"] - df["sell"]) / 1000
-            
-            pivoted = df.pivot_table(
-                index="date", 
-                columns="name", 
-                values="buy_minus_sell", 
-                aggfunc="sum"
-            ).fillna(0)
-            
-            pivoted = pivoted.tail(7).reset_index()
-            pivoted.rename(columns={"date": "日期"}, inplace=True)
-            
-            for col in ["Foreign_Investor", "Investment_Trust", "Dealer_Self"]:
-                if col not in pivoted.columns:
-                    pivoted[col] = 0
-                    
-            pivoted.rename(columns={
-                "Foreign_Investor": "外資",
-                "Investment_Trust": "投信",
-                "Dealer_Self": "自營商"
-            }, inplace=True)
-            
-            pivoted["外資"] = pivoted["外資"].astype(int)
-            pivoted["投信"] = pivoted["投信"].astype(int)
-            pivoted["自營商"] = pivoted["自營商"].astype(int)
-            pivoted["合計"] = pivoted["外資"] + pivoted["投信"] + pivoted["自營商"]
-            
-            return pivoted[["日期", "外資", "投信", "自營商", "合計"]].sort_values("日期", ascending=False)
-    except Exception:
-        pass
-        
-    return pd.DataFrame(columns=["日期", "外資", "投信", "自營商", "合計"])
+
+        if data.get("msg") != "success" or not data.get("data"):
+            return pd.DataFrame(
+                [["無資料", 0, 0, 0, 0]],
+                columns=["日期", "外資", "投信", "自營商", "合計"],
+            )
+
+        df_raw = pd.DataFrame(data["data"])
+        df_raw["buy_sell_sheet"] = (df_raw["buy"] - df_raw["sell"]) / 1000
+
+        def categorize(name):
+            if "Foreign" in name:
+                return "外資"
+            elif "Investment_Trust" in name:
+                return "投信"
+            elif "Dealer" in name:
+                return "自營商"
+            return "其他"
+
+        df_raw["法人類別"] = df_raw["name"].apply(categorize)
+
+        df_pivot = df_raw.pivot_table(
+            index="date",
+            columns="法人類別",
+            values="buy_sell_sheet",
+            aggfunc="sum",
+        ).fillna(0)
+
+        for col in ["外資", "投信", "自營商"]:
+            if col not in df_pivot.columns:
+                df_pivot[col] = 0
+
+        for col in ["外資", "投信", "自營商"]:
+            df_pivot[col] = np.round(df_pivot[col]).astype(int)
+
+        df_pivot["合計"] = (
+            df_pivot["外資"] + df_pivot["投信"] + df_pivot["自營商"]
+        )
+
+        df_result = df_pivot.tail(7).iloc[::-1].reset_index()
+        df_result.rename(columns={"date": "日期"}, inplace=True)
+        df_result["日期"] = pd.to_datetime(df_result["日期"]).dt.strftime(
+            "%m/%d"
+        )
+
+        return df_result[["日期", "外資", "投信", "自營商", "合計"]]
+
+    except Exception as e:
+        return pd.DataFrame(
+            [["網路異常", 0, 0, 0, 0]],
+            columns=["日期", "外資", "投信", "自營商", "合計"],
+        )
 
 
 @st.cache_data
